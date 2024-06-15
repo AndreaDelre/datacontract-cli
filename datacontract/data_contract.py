@@ -459,6 +459,7 @@ class DataContract:
         bigquery_project: typing.Optional[str] = None,
         bigquery_dataset: typing.Optional[str] = None,
     ) -> DataContractSpecification:
+        print('repo with edition')
         data_contract_specification = DataContract.init()
 
         if format == "sql":
