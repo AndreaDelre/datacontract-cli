@@ -1,4 +1,6 @@
 import boto3
+import json
+import re
 from typing import List
 
 from datacontract.model.data_contract_specification import (
@@ -104,7 +106,130 @@ def get_glue_table_schema(database_name: str, table_name: str):
                 }
             )
 
+    table_schema = format_schema(table_schema)
+
     return table_schema
+
+
+def generate_sub_fields(original_type_field):
+    iteration_count = original_type_field.count("<")
+
+    for i in range(iteration_count):
+
+        index_opening_sub_element = original_type_field.rfind("<")
+
+        sub_text = original_type_field[index_opening_sub_element:]
+
+        index_closing_sub_element = index_opening_sub_element + sub_text.find(">")
+
+        content = original_type_field[index_opening_sub_element + 1 :index_closing_sub_element]
+        prev_content = original_type_field[:index_opening_sub_element]
+
+        index_start_end_content = index_closing_sub_element + 1
+        end_content = original_type_field[index_start_end_content:]
+
+        sub_content_type = re.findall(r'\b\w+\b', prev_content)[-1]
+
+
+        if sub_content_type == "struct":
+            new_prev_content = prev_content[:-6]
+
+            fields_from_string = content.split(",")
+
+            fields = "["
+
+            last_item_index = len(fields_from_string) - 1
+
+            for x, field in enumerate(fields_from_string):
+                count_caracter = field.count(':')
+                if count_caracter == 1:
+                    sub_filed = field.split(':')
+                    fileds_to_add = f"{{'Name': '{sub_filed[0]}'|'Type': '{sub_filed[1]}'}}"
+                else:
+                    name_position = field.find(':')
+                    name = field[:name_position]
+                    new_field = field[name_position + 1:]
+
+                    fileds_to_add = f"{{'Name':'{name}'|{new_field}}}"
+                
+                fields += fileds_to_add + "|" if x < last_item_index else fileds_to_add
+            
+            fields += "]"
+
+
+            original_type_field = f"{new_prev_content}'Type':'struct'|'Fields':{fields}{end_content}"
+
+        if sub_content_type == "array":
+            new_prev_content = prev_content[:-5]
+            if content.startswith("'Type'"):
+                original_type_field = f"{new_prev_content}'Type':'array'|'Items':{{{content}}}{end_content}"
+            else:
+                original_type_field = f"{new_prev_content}'Type':'array'|'Items':{{'Type':'{content}'}}{end_content}"
+
+    original_type_field = original_type_field.replace('|', ',').replace("'",'"')
+
+    original_type_field = f"{{{original_type_field}}}"
+
+    return json.loads(original_type_field)
+
+
+def format_schema(schema):
+    for column in schema:
+        if column['Type'].startswith("array<"):
+            items = generate_sub_fields(column['Type'])['Items']
+            column['Items'] = items
+            column['Type'] = "array"
+        elif column['Type'].startswith("struct<"):
+            fields = generate_sub_fields(column['Type'])['Fields']
+            column['Fields'] = fields
+            column['Type'] = "struct"
+    
+    return schema
+
+
+def import_record_fields(record_fields):
+    imported_fields = {}
+    for field in record_fields:
+
+        imported_field = Field()
+
+        field_type = map_type_from_sql(field.get("Type"))
+
+        if field.get("Hive"):
+            imported_field.required = True
+        else:
+            imported_field.required = False
+        
+        imported_field.description = field.get("Comment")
+
+        if field_type == "struct":
+            imported_field.type = field_type
+            imported_field.fields = import_record_fields(field.get("Fields"))
+        elif field_type == "array":
+            imported_field.type = field_type
+            imported_field.items = import_array_field(field.get("Items"))
+        else:
+            imported_field.type = field_type
+
+        imported_fields[field.get("Name")] = imported_field
+
+    return imported_fields
+
+
+def import_array_field(array_field):
+    items = Field()
+    field_type = map_type_from_sql(array_field.get("Type"))
+
+    if field_type == "struct":
+        items.type = field_type
+        items.fields = import_record_fields(array_field.get("Fields"))
+    elif field_type == "array":
+        items.type = field_type
+        items.fields = import_array_field(array_field.get("Items"))
+    else:
+        items.type = field_type
+
+    return items
 
 
 def import_glue(data_contract_specification: DataContractSpecification, source: str, table_names: List[str]):
@@ -129,18 +254,7 @@ def import_glue(data_contract_specification: DataContractSpecification, source: 
 
         table_schema = get_glue_table_schema(source, table_name)
 
-        fields = {}
-        for column in table_schema:
-            field = Field()
-            field.type = map_type_from_sql(column["Type"])
-
-            # hive partitons are required, but are not primary keys
-            if column.get("Hive"):
-                field.required = True
-
-            field.description = column.get("Comment")
-
-            fields[column["Name"]] = field
+        fields = import_record_fields(table_schema)
 
         data_contract_specification.models[table_name] = Model(
             type="table",
@@ -180,5 +294,9 @@ def map_type_from_sql(sql_type: str):
         return "timestamp"
     elif sql_type.lower().startswith("date"):
         return "date"
+    elif sql_type.lower().startswith("array"):
+        return "array"
+    elif sql_type.lower().startswith("struct"):
+        return "struct"
     else:
         return "variant"
